@@ -1,0 +1,1496 @@
+diff --git a/README.GCview b/README.GCview
+new file mode 100644
+index 0000000..a8e289f
+--- /dev/null
++++ b/README.GCview
+@@ -0,0 +1,19 @@
++Currently, before v8 with the GCview changes, you first need to get
++a clone of the GCview repository:
++
++git clone git@git.corp.adobe.com:LCVM/gcview.git <your GCview dir>
++
++and then create a link to it from the v8 src/ directory:
++
++ln -s <your GCview dir> <your v8 dir>/src/gcview
++
++In the future, I'll change the GYP build process to automatically
++checkout the right revision of GCview.
++
++The v8 shell has three GCview-related parameters:
++
++--gcview-enable : it enables GCview
++--gcview-trace-file <trace file> : it specifies the name of the trace file
++(the default is: gcview_v8_trace)
++--gcview-level <level> : it specifies the visualization level, appropriate values are 0 (low), 1 (medium - default), and 2 (high - currently not different from medium)
++
+diff --git a/src/flag-definitions.h b/src/flag-definitions.h
+index 49dac4a..adfcc6b 100644
+--- a/src/flag-definitions.h
++++ b/src/flag-definitions.h
+@@ -496,6 +496,11 @@ DEFINE_int(marking_threads, 0, "number of parallel marking threads")
+ #ifdef VERIFY_HEAP
+ DEFINE_bool(verify_heap, false, "verify heap pointers before and after GC")
+ #endif
++DEFINE_bool(gcview_enable, false, "enable GCview")
++DEFINE_int(gcview_level, 1,
++           "detail level for GCview (0-low, 1-medium, 2-high)")
++DEFINE_string(gcview_trace_file,
++              "gcview_v8_trace", "file name for the GCview trace")
+ 
+ // v8.cc
+ DEFINE_bool(use_idle_notification, true,
+diff --git a/src/gcview-glue.cc b/src/gcview-glue.cc
+new file mode 100644
+index 0000000..53361c3
+--- /dev/null
++++ b/src/gcview-glue.cc
+@@ -0,0 +1,1014 @@
++// Copyright 2012 the V8 project authors. All rights reserved.
++// Redistribution and use in source and binary forms, with or without
++// modification, are permitted provided that the following conditions are
++// met:
++//
++//     * Redistributions of source code must retain the above copyright
++//       notice, this list of conditions and the following disclaimer.
++//     * Redistributions in binary form must reproduce the above
++//       copyright notice, this list of conditions and the following
++//       disclaimer in the documentation and/or other materials provided
++//       with the distribution.
++//     * Neither the name of Google Inc. nor the names of its
++//       contributors may be used to endorse or promote products derived
++//       from this software without specific prior written permission.
++//
++// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++
++#include "v8.h"
++
++#include "gcview-glue.h"
++
++#include "gcview/src/gcview.hpp"
++
++namespace v8 {
++namespace internal {
++
++typedef gcview::BoolValue BoolV;
++typedef gcview::ByteValue ByteV;
++typedef gcview::IntValue IntV;
++typedef gcview::DoubleValue DoubleV;
++typedef gcview::StringValue StringV;
++typedef gcview::EnumValue EnumV;
++
++typedef gcview::BoolArray BoolA;
++typedef gcview::ByteArray ByteA;
++typedef gcview::IntArray IntA;
++typedef gcview::DoubleArray DoubleA;
++typedef gcview::StringArray StringA;
++typedef gcview::EnumArray EnumA;
++
++////////// GCview event names //////////
++static const char* kScavengeStartEventName = "Scavenge Start";
++static const char* kScavengeEndEventName = "Scavenge End";
++static const char* kFullGCStartEventName = "Full GC Start";
++static const char* kFullGCEndEventName = "Full GC End";
++
++////////// GCview space names //////////
++static const char* kSummarySpaceName = "Summary";
++static const char* kNewSpaceName = "New Space";
++static const char* kOldPointerSpaceName = "Old Pointer Space";
++static const char* kOldDataSpaceName = "Old Data Space";
++static const char* kCodeSpaceName = "Code Space";
++static const char* kMapSpaceName = "Map Space";
++static const char* kCellSpaceName = "Cell Space";
++static const char* kPropertyCellSpaceName = "Property Cell Space";
++static const char* kLargeObjectSpaceName = "Large Object Space";
++// Store Buffer Space is only available when level >= Medium
++static const char* kStoreBufferSpaceName = "Store Buffer";
++
++////////// GCview data names for summary space //////////
++static const char* kLevelValueName = "Level";
++
++static const char* kGCSummaryGroupName = "GC Summary";
++static const char* kGCTypeArrayName = "GC Type";
++static const char* kGCCountArrayName = "GC Count";
++static const char* kLastGCTimeArrayName = "Last GC Time";
++static const char* kTotalGCTimeArrayName = "Total GC Time";
++
++static const char* kHeapSummaryGroupName = "Heap Summary";
++static const char* kPageSizeValueName = "Standard Page Size";
++static const char* kHeapPageNumberValueName = "Heap Page Number";
++static const char* kHeapSOSPageNumberValueName = "Heap S-O-S Page Number";
++static const char* kHeapUsedSizeValueName = "Heap Used Size";
++static const char* kHeapCommittedSizeValueName = "Heap Committed Size";
++static const char* kHeapReservedSizeValueName = "Heap Reserved Size";
++
++////////// GCview data names for all heap spaces //////////
++static const char* kPageNumberValueName = "Page Number";
++static const char* kSOSPageNumberValueName = "S-O-S Page Number";
++static const char* kTotalUsedSizeValueName = "Total Used Size";
++static const char* kTotalCommittedSizeValueName = "Total Committed Size";
++static const char* kTotalReservedSizeValueName = "Total Reserved Size";
++static const char* kAddressRangeArrayName = "Address Range";
++static const char* kUsedSizeArrayName = "Used Size";
++static const char* kCommittedSizeArrayName = "Committed Size";
++static const char* kScanOnScavengeArrayName = "Scan On Scavenge";
++
++////////// GCview data names for new space //////////
++static const char* kIsCommittedArrayName = "Is Committed";
++
++////////// GCview data names for paged space //////////
++static const char* kUnavailableFreeSizeArrayName = "Free Size (Unavailable)";
++static const char* kSmallFreeSizeArrayName = "Free Size (Small)";
++static const char* kMediumFreeSizeArrayName = "Free Size (Medium)";
++static const char* kLargeFreeSizeArrayName = "Free Size (Large)";
++static const char* kHugeFreeSizeArrayName = "Free Size (Huge)";
++
++////////// GCview data names for paged space free lists //////////
++static const char* kFreeListGroupName = "Free Lists";
++static const char* kTotalFreeSizeValueName = "Total Free Size";
++// Total Free Chunks is only available when level >= Medium
++static const char* kTotalFreeChunksValueName = "Total Free Chunk Number";
++static const char* kFreeListNameArrayName = "Free List Category";
++static const char* kFreeSizeArrayName = "Free Size";
++// Free Chunks is only available when level >= Medium
++static const char* kFreeChunksArrayName = "Free Chunk Number";
++
++////////// GCview data names for paged space free chunk distribution //////////
++static const char* kFreeChunkDistGroupName = "Free Chunk Distribution";
++// Bucket Range is only available when level >= Medium
++static const char* kFreeChunkDistRangeName = "Bucket Range";
++// Bucket Population is only available when level >= Medium
++static const char* kFreeChunkDistPopulationName = "Bucket Population";
++// Bucket Size is only available when level >= Medium
++static const char* kFreeChunkDistSizeName = "Bucket Size";
++
++////////// GCview data names for code space //////////
++// The data below is only available when level >= High
++static const char* kNoCodeAgeName = "No Age";
++static const char* kCodeAgeNameFormat = "Age %u";
++static const char* kCodeSizeForNoAgeArrayName = "No Age Code Size";
++static const char* kCodeSizeForAgeArrayFormat = "Age %u Code Size";
++
++static const char* kCodeAgeGroupName = "Code Ages";
++static const char* kCodeAgeNamesArrayName = "Code Age Name";
++static const char* kCodeSizeArrayName = "Code Object Size";
++static const char* kCodeNumberArrayName = "Code Object Number";
++static const char* kOptFuncSizeArrayName = "Opt Function Size";
++static const char* kOptFuncNumberArrayName = "Opt Function Number";
++
++static const char* kCodeKindsGroupName = "Code Kinds";
++static const char* kCodeKindNamesArrayName = "Code Kind Name";
++static const char* kCodeKindSizeArrayName = "Code Kind Object Size";
++static const char* kCodeKindNumberArrayName = "Code Kind Object Number";
++
++////////// GCview data names for fixed spaces //////////
++static const char* kObjSizeValueName = "Object Size";
++
++////////// GCview data names for store buffer space //////////
++// The data below is only available when level >= Medium
++static const char* kSBNewBufferSizeValueName = "New Buffer Size";
++static const char* kSBOldBufferSizeValueName = "Old Buffer Size";
++static const char* kSBOldBufferLimitSizeValueName = "Old Buffer Limit Size";
++static const char* kSBOverflowCountValueName = "Overflow Count";
++static const char* kSBCompactionCountValueName = "Compaction Count";
++static const char* kSBSpaceNamesArrayName = "Space Name";
++static const char* kSBEntryNumbersArrayName = "Entry Number";
++
++static const unsigned kFreeChunkHistoLimits[] = {
++          256,
++          512,
++         1024,
++     2 * 1024,
++     4 * 1024,
++     8 * 1024,
++    16 * 1024,
++    32 * 1024,
++    64 * 1024,
++
++            0 /* sentinel, do not remove */
++};
++
++////////// Utilities //////////
++
++unsigned GCviewGlue::FindHistoIndex(unsigned size_bytes) {
++  unsigned index = 0;
++  for ( ; index < free_histo_limits_num_; index += 1) {
++    if (size_bytes < kFreeChunkHistoLimits[index]) break;
++  }
++  ASSERT_LE(index, free_histo_limits_num_);
++  return index;
++}
++
++unsigned GCviewGlue::FindPageIndex(PagedSpace* space, Page* page) {
++  unsigned index = 0;
++  PageIterator iter(space);
++  while (iter.has_next()) {
++    Page* curr = iter.next();
++    if (page == curr) return index;
++    index += 1;
++  }
++  UNREACHABLE();
++  return 0;
++}
++
++class SpaceUpdater BASE_EMBEDDED {
++public:
++  SpaceUpdater(gcview::GCview* gcview, const char* space_name) {
++    gcview::Space* sp = gcview->findSpace(space_name);
++
++    page_number_value_ = sp->findIntValue(kPageNumberValueName);
++    sos_page_number_value_ = sp->findIntValue(kSOSPageNumberValueName);
++    total_used_size_value_ = sp->findIntValue(kTotalUsedSizeValueName);
++    total_committed_size_value_ =
++        sp->findIntValue(kTotalCommittedSizeValueName);
++    total_reserved_size_value_ = sp->findIntValue(kTotalReservedSizeValueName);
++    addr_range_array_ = sp->findStringArray(kAddressRangeArrayName);
++    used_size_array_ = sp->findIntArray(kUsedSizeArrayName);
++    committed_size_array_ = sp->findIntArray(kCommittedSizeArrayName);
++    scan_on_scavenge_array_ = sp->findBoolArray(kScanOnScavengeArrayName);
++  }
++
++  void Reset(unsigned page_num) {
++    page_number_value_->value() = (int) page_num;
++    sos_page_number_value_->value() = 0;
++    total_used_size_value_->value() = 0;
++    total_committed_size_value_->value() = 0;
++    total_reserved_size_value_->value() = 0;
++    addr_range_array_->resize(page_num);
++    used_size_array_->resize(page_num);
++    committed_size_array_->resize(page_num);
++    scan_on_scavenge_array_->resize(page_num);
++  }
++
++  void ResetUsedCommitted() {
++    total_used_size_value_->value() = 0;
++    total_committed_size_value_->value() = 0;
++    used_size_array_->reset(0);
++    committed_size_array_->reset(0);
++  }
++
++    void AddReservedPage(unsigned index, Address start, Address end,
++                         int reserved_size_bytes) {
++    ASSERT_LT(start, end);
++
++    char buffer[64];
++    gcview::Utils::formatStr(buffer, 64, "[%p, %p)", start, end);
++
++    total_reserved_size_value_->value() += reserved_size_bytes;
++    addr_range_array_->value(index) = buffer;
++  }
++
++  void SetUsed(unsigned index, int used_size_bytes) {
++    total_used_size_value_->value() += used_size_bytes;
++    used_size_array_->value(index) = used_size_bytes;
++  }
++
++  void SetCommitted(unsigned index, int committed_size_bytes) {
++    total_committed_size_value_->value() += committed_size_bytes;
++    committed_size_array_->value(index) = committed_size_bytes;
++  }
++
++  void AddPage(unsigned index, MemoryChunk* page) {
++    AddReservedPage(index, page->address(),
++                    page->area_end(), (int) page->size());
++    SetUsed(index, page->area_size());
++    SetCommitted(index, page->size());
++    if (page->scan_on_scavenge()) {
++      sos_page_number_value_->value() += 1;
++    }
++    scan_on_scavenge_array_->value(index) = page->scan_on_scavenge();
++  }
++
++  static unsigned GetNewPageIndex(NewSpace* space, MemoryChunk* page) {
++    uintptr_t diff = (uintptr_t) page->address() - (uintptr_t) space->start();
++    return (unsigned) diff / (unsigned) Page::kPageSize;
++  }
++
++private:
++  IntV* page_number_value_;
++  IntV* sos_page_number_value_;
++  IntV* total_used_size_value_;
++  IntV* total_committed_size_value_;
++  IntV* total_reserved_size_value_;
++  StringA* addr_range_array_;
++  IntA* used_size_array_;
++  IntA* committed_size_array_;
++  BoolA* scan_on_scavenge_array_;
++};
++
++////////// Set Up //////////
++
++GCviewGlue::GCviewGlue()
++    : level_(0), free_histo_limits_num_(0), gcview_(NULL),
++      writer_(NULL), array_writer_(NULL) {
++  unsigned num = 0;
++  while (kFreeChunkHistoLimits[num] != 0) {
++    num += 1;
++  }
++  free_histo_limits_num_ = num;
++}
++
++gcview::Space* GCviewGlue::AddSummarySpace(const char* space_name) {
++  gcview::Space* sp = gcview_->addSpace(space_name);
++
++  StringV* level_value = sp->addData<StringV>(kLevelValueName);
++  if (IsLevelHigh()) {
++    level_value->value() = "High";
++  } else if (IsLevelMedium()) {
++    level_value->value() = "Medium";
++  } else {
++    level_value->value() = "Low";
++  }
++
++  // GC Summary
++  StringA* gc_type_array = sp->addData<StringA>(kGCTypeArrayName,
++                                                kGCSummaryGroupName);
++  IntA* gc_count_array = sp->addData<IntA>(kGCCountArrayName,
++                                           kGCSummaryGroupName);
++  DoubleA* last_gc_time_array = sp->addData<DoubleA>(kLastGCTimeArrayName,
++                                                     kGCSummaryGroupName);
++  DoubleA* total_gc_time_array = sp->addData<DoubleA>(kTotalGCTimeArrayName,
++                                                      kGCSummaryGroupName);
++
++  gc_type_array->resize(GCTypeNum);
++  gc_type_array->value(ScavengeGC) = "Scavenge GC";
++  gc_type_array->value(FullGC) = "Full GC";
++  gc_count_array->resize(GCTypeNum);
++  last_gc_time_array->resize(GCTypeNum);
++  total_gc_time_array->resize(GCTypeNum);
++
++  // Heap Summary
++  IntV* page_size_value = sp->addData<IntV>(kPageSizeValueName,
++                                            kHeapSummaryGroupName);
++  sp->addData<IntV>(kHeapPageNumberValueName, kHeapSummaryGroupName);
++  sp->addData<IntV>(kHeapSOSPageNumberValueName, kHeapSummaryGroupName);
++  sp->addData<IntV>(kHeapUsedSizeValueName, kHeapSummaryGroupName);
++  sp->addData<IntV>(kHeapCommittedSizeValueName, kHeapSummaryGroupName);
++  sp->addData<IntV>(kHeapReservedSizeValueName, kHeapSummaryGroupName);
++
++  page_size_value->value() = Page::kPageSize;
++
++  return sp;
++}
++
++gcview::Space* GCviewGlue::AddHeapSpace(const char* space_name,
++                                         Space* space) {
++  gcview::Space* sp = gcview_->addSpace(space_name);
++
++  sp->addData<IntV>(kPageNumberValueName);
++  sp->addData<IntV>(kSOSPageNumberValueName);
++  sp->addData<IntV>(kTotalUsedSizeValueName);
++  sp->addData<IntV>(kTotalCommittedSizeValueName);
++  sp->addData<IntV>(kTotalReservedSizeValueName);
++  sp->addData<StringA>(kAddressRangeArrayName);
++  sp->addData<IntA>(kUsedSizeArrayName);
++  sp->addData<IntA>(kCommittedSizeArrayName);
++  sp->addData<BoolA>(kScanOnScavengeArrayName);
++
++  return sp;
++}
++
++gcview::Space* GCviewGlue::AddNewSpace(const char* space_name,
++                                        NewSpace* space) {
++  gcview::Space* sp = AddHeapSpace(space_name, space);
++
++  Address start = space->start();
++  int max_capacity = 2 * space->MaximumCapacity();
++  Address end = start + max_capacity;
++  // end is used in asserts and the compiler will complain that
++  // it is not used in release builds
++  (void) end;
++  const unsigned page_num = (unsigned) (max_capacity / Page::kPageSize);
++
++  SpaceUpdater updater(gcview_, space_name);
++  updater.Reset(page_num);
++  Address from = start;
++  Address to = from + Page::kPageSize;
++  for (unsigned i = 0; i < page_num; i += 1) {
++    ASSERT_LE(start, from);
++    ASSERT_LE(from, end);
++    ASSERT_LE(from, to);
++    ASSERT_LE(to, end);
++
++    updater.AddReservedPage(i, from, to, Page::kPageSize);
++    from = to;
++    to += Page::kPageSize;
++  }
++
++  BoolA* is_committed_array = sp->addData<BoolA>(kIsCommittedArrayName);
++  is_committed_array->resize(page_num);
++
++  sp->findBoolArray(kScanOnScavengeArrayName)->resize(page_num);
++
++  return sp;
++}
++
++class BucketSizeFormatter BASE_EMBEDDED {
++public:
++  BucketSizeFormatter(unsigned size_bytes) {
++    if (size_bytes < 1024) {
++      gcview::Utils::formatStr(buffer_, 16, "%u", size_bytes);
++    } else {
++      ASSERT_EQ(size_bytes % 1024, 0);
++      gcview::Utils::formatStr(buffer_, 16, "%uK", size_bytes / 1024);
++    }
++  }
++
++  const char* GetStr() const { return buffer_; }
++
++private:
++  char buffer_[16];
++};
++
++gcview::Space* GCviewGlue::AddPagedSpace(const char* space_name,
++                                          PagedSpace* space) {
++  gcview::Space* sp = AddHeapSpace(space_name, space);
++
++  sp->addData<IntA>(kUnavailableFreeSizeArrayName);
++  sp->addData<IntA>(kSmallFreeSizeArrayName);
++  sp->addData<IntA>(kMediumFreeSizeArrayName);
++  sp->addData<IntA>(kLargeFreeSizeArrayName);
++  sp->addData<IntA>(kHugeFreeSizeArrayName);
++
++  sp->addData<IntV>(kTotalFreeSizeValueName, kFreeListGroupName);
++  if (IsLevelMedium()) {
++    sp->addData<IntV>(kTotalFreeChunksValueName, kFreeListGroupName);
++  }
++  StringA* free_list_name_array = sp->addData<StringA>(kFreeListNameArrayName,
++                                                       kFreeListGroupName);
++  IntA* free_size_array = sp->addData<IntA>(kFreeSizeArrayName,
++                                            kFreeListGroupName);
++  if (IsLevelMedium()) {
++    IntA* free_chunks_array = sp->addData<IntA>(kFreeChunksArrayName,
++                                                kFreeListGroupName);
++    StringA* free_chunk_dist_range_array =
++        sp->addData<StringA>(kFreeChunkDistRangeName, kFreeChunkDistGroupName);
++    IntA* free_chunk_dist_size_array =
++        sp->addData<IntA>(kFreeChunkDistSizeName, kFreeChunkDistGroupName);
++    IntA* free_chunk_dist_population_array =
++        sp->addData<IntA>(kFreeChunkDistPopulationName,
++                          kFreeChunkDistGroupName);
++
++    free_chunks_array->resize((unsigned) FreeListCategoryNum);
++    free_chunk_dist_range_array->resize(free_histo_limits_num_ + 1);
++    free_chunk_dist_size_array->resize(free_histo_limits_num_ + 1);
++    free_chunk_dist_population_array->resize(free_histo_limits_num_ + 1);
++
++    char buffer[64];
++    unsigned prev_limit = 0;
++    unsigned i = 0;
++    for ( ; i < free_histo_limits_num_; i += 1) {
++      unsigned limit = kFreeChunkHistoLimits[i];
++      BucketSizeFormatter from_formatter(prev_limit);
++      BucketSizeFormatter to_formatter(limit);
++
++      gcview::Utils::formatStr(buffer, 64, "[%s, %s)",
++                                from_formatter.GetStr(), to_formatter.GetStr());
++      free_chunk_dist_range_array->value(i) = buffer;
++      prev_limit = limit;
++    }
++    BucketSizeFormatter from_formatter(prev_limit);
++    gcview::Utils::formatStr(buffer, 64, "[%s, ...)", from_formatter.GetStr());
++    free_chunk_dist_range_array->value(i) = buffer;
++  }
++
++  free_list_name_array->resize((unsigned) FreeListCategoryNum);
++  free_list_name_array->value((unsigned) UnavailableList) = "Unavailable";
++  free_list_name_array->value((unsigned) SmallList) = "Small";
++  free_list_name_array->value((unsigned) MediumList) = "Medium";
++  free_list_name_array->value((unsigned) LargeList) = "Large";
++  free_list_name_array->value((unsigned) HugeList) = "Huge";
++  free_size_array->resize((unsigned) FreeListCategoryNum);
++
++  return sp;
++}
++
++gcview::Space* GCviewGlue::AddFixedSpace(const char* space_name,
++                                         FixedSpace* space) {
++  gcview::Space* sp = AddPagedSpace(space_name, space);
++
++  IntV* obj_size_value = sp->addData<IntV>(kObjSizeValueName);
++  obj_size_value->value() = space->object_size_in_bytes();
++
++  return sp;
++}
++
++gcview::Space* GCviewGlue::AddCodeSpace(const char* space_name,
++                                         PagedSpace* space) {
++  gcview::Space* sp = AddPagedSpace(space_name, space);
++
++  if (IsLevelHigh()) {
++    const unsigned age_num = Code::kLastCodeAge + 1;
++    sp->addData<IntA>(kCodeSizeForNoAgeArrayName);
++    for (unsigned i = 1; i < age_num; i += 1) {
++      char buffer[64];
++      gcview::Utils::formatStr(buffer, 64, kCodeSizeForAgeArrayFormat, i);
++      sp->addData<IntA>(buffer);
++    }
++
++    StringA* code_age_names = sp->addData<StringA>(kCodeAgeNamesArrayName,
++                                                   kCodeAgeGroupName);
++    IntA* code_size_array = sp->addData<IntA>(kCodeSizeArrayName,
++                                              kCodeAgeGroupName);
++    IntA* code_num_array = sp->addData<IntA>(kCodeNumberArrayName,
++                                             kCodeAgeGroupName);
++    IntA* opt_func_size_array = sp->addData<IntA>(kOptFuncSizeArrayName,
++                                                  kCodeAgeGroupName);
++    IntA* opt_func_num_array = sp->addData<IntA>(kOptFuncNumberArrayName,
++                                                 kCodeAgeGroupName);
++
++    code_age_names->resize(age_num);
++    code_age_names->value(0) = kNoCodeAgeName;
++    for (unsigned i = 1; i < age_num; i += 1) {
++      char buffer[64];
++      gcview::Utils::formatStr(buffer, 64, kCodeAgeNameFormat, i);
++      code_age_names->value(i) = buffer;
++    }
++    code_size_array->resize(age_num);
++    code_num_array->resize(age_num);
++    opt_func_size_array->resize(age_num);
++    opt_func_num_array->resize(age_num);
++
++    StringA* code_kind_names = sp->addData<StringA>(kCodeKindNamesArrayName,
++                                                    kCodeKindsGroupName);
++    IntA* code_kind_size_array = sp->addData<IntA>(kCodeKindSizeArrayName,
++                                                   kCodeKindsGroupName);
++    IntA* code_kind_num_array = sp->addData<IntA>(kCodeKindNumberArrayName,
++                                                  kCodeKindsGroupName);
++    const unsigned kind_num = (unsigned) Code::LAST_CODE_KIND + 1;
++
++    code_kind_names->resize(kind_num);
++    code_kind_size_array->resize(kind_num);
++    code_kind_num_array->resize(kind_num);
++
++    code_kind_names->value(Code::FUNCTION) = "Function";
++    code_kind_names->value(Code::OPTIMIZED_FUNCTION) = "Opt Function";
++    code_kind_names->value(Code::STUB) = "Stub";
++    code_kind_names->value(Code::BUILTIN) = "Builtin";
++    code_kind_names->value(Code::LOAD_IC) = "Load IC";
++    code_kind_names->value(Code::KEYED_LOAD_IC) = "Keyed Load IC";
++    code_kind_names->value(Code::STORE_IC) = "Store IC";
++    code_kind_names->value(Code::KEYED_STORE_IC) = "Keyed Store IC";
++    code_kind_names->value(Code::CALL_IC) = "Call IC";
++    code_kind_names->value(Code::KEYED_CALL_IC) = "Keyed Call IC";
++    code_kind_names->value(Code::UNARY_OP_IC) = "Unary Op IC";
++    code_kind_names->value(Code::BINARY_OP_IC) = "Binary Op IC";
++    code_kind_names->value(Code::COMPARE_IC) = "Compare IC";
++    code_kind_names->value(Code::COMPARE_NIL_IC) = "Compare Nil IC";
++    code_kind_names->value(Code::TO_BOOLEAN_IC) = "To Boolean IC";
++  }
++
++  return sp;
++}
++
++gcview::Space* GCviewGlue::AddLargeObjectSpace(const char* space_name,
++                                                LargeObjectSpace* space) {
++  gcview::Space* sp = AddHeapSpace(space_name, space);
++
++  return sp;
++}
++
++gcview::Space* GCviewGlue::AddStoreBufferSpace(const char* space_name,
++                                                StoreBuffer* store_buffer) {
++  gcview::Space* sp = NULL;
++
++  if (IsLevelMedium()) {
++    sp = gcview_->addSpace(space_name);
++    sp->addData<IntV>(kSBNewBufferSizeValueName);
++    sp->addData<IntV>(kSBOldBufferLimitSizeValueName);
++    sp->addData<IntV>(kSBOldBufferSizeValueName);
++    sp->addData<IntV>(kSBOverflowCountValueName);
++    sp->addData<IntV>(kSBCompactionCountValueName);
++
++    StringA* space_names_array = sp->addData<StringA>(kSBSpaceNamesArrayName);
++    IntA* entry_num_array = sp->addData<IntA>(kSBEntryNumbersArrayName);
++    const unsigned num = LAST_SPACE;
++    space_names_array->resize(num);
++    // skipping New Space (clearly!)
++    space_names_array->value(OLD_POINTER_SPACE - 1) = "Old Pointer";
++    space_names_array->value(OLD_DATA_SPACE - 1) = "Old Data";
++    space_names_array->value(CODE_SPACE - 1) = "Code";
++    space_names_array->value(MAP_SPACE - 1) = "Map";
++    space_names_array->value(CELL_SPACE - 1) = "Cell";
++    space_names_array->value(PROPERTY_CELL_SPACE - 1) = "Property Cell";
++    space_names_array->value(LO_SPACE - 1) = "Large Object";
++    entry_num_array->resize(num);
++  }
++
++  return sp;
++}
++
++void GCviewGlue::SetUp(Heap* heap) {
++  ASSERT_EQ(gcview_, NULL);
++  ASSERT_EQ(writer_, NULL);
++  ASSERT_EQ(array_writer_, NULL);
++  if (!FLAG_gcview_enable) return;
++
++  level_ = FLAG_gcview_level;
++  level_ = Max(level_, 0);
++  level_ = Min(level_, 2);
++
++  gcview_ = new gcview::GCview("V8 VM", GetNowSec());
++  gcview_->addEvent(kScavengeStartEventName);
++  gcview_->addEvent(kScavengeEndEventName);
++  gcview_->addEvent(kFullGCStartEventName);
++  gcview_->addEvent(kFullGCEndEventName);
++
++  AddSummarySpace(kSummarySpaceName);
++  AddNewSpace(kNewSpaceName, heap->new_space());
++  AddPagedSpace(kOldPointerSpaceName, heap->old_pointer_space());
++  AddPagedSpace(kOldDataSpaceName, heap->old_data_space());
++  AddCodeSpace(kCodeSpaceName, heap->code_space());
++  AddFixedSpace(kMapSpaceName, heap->map_space());
++  AddFixedSpace(kCellSpaceName, heap->cell_space());
++  AddFixedSpace(kPropertyCellSpaceName, heap->property_cell_space());
++  AddLargeObjectSpace(kLargeObjectSpaceName, heap->lo_space());
++  AddStoreBufferSpace(kStoreBufferSpaceName, heap->store_buffer());
++
++  const char *file_name = FLAG_gcview_trace_file;
++  char buffer[256];
++  int isolate_id = heap->isolate()->id();
++  if (isolate_id != 1) {
++    gcview::Utils::formatStr(buffer, 256, "%s.%d",
++                              FLAG_gcview_trace_file, isolate_id);
++    file_name = buffer;
++  }
++  writer_ = new gcview::JSONWriter(file_name);
++  array_writer_ = new gcview::JSONArrayWriter(writer_);
++
++  array_writer_->startElem();
++  gcview_->writeJSONMetadata(writer_);
++}
++
++////////// Update Data For Single Event //////////
++
++void GCviewGlue::UpdateSummarySpace(const char* space_name, Heap* heap) {
++  gcview::Space* sp = gcview_->findSpace(space_name);
++
++  IntA* gc_count_array = sp->findIntArray(kGCCountArrayName);
++  DoubleA* last_gc_time_array = sp->findDoubleArray(kLastGCTimeArrayName);
++  DoubleA* total_gc_time_array = sp->findDoubleArray(kTotalGCTimeArrayName);
++
++  gc_count_array->value(ScavengeGC) = (int) heap->scavenge_count();
++  last_gc_time_array->value(ScavengeGC) =
++      heap->last_scavenge_time_ms() / 1000.0;
++  total_gc_time_array->value(ScavengeGC) =
++      heap->total_scavenge_time_ms() / 1000.0;
++
++  gc_count_array->value(FullGC) = (int) heap->full_gc_count();
++  last_gc_time_array->value(FullGC) = heap->last_full_gc_time_ms() / 1000.0;
++  total_gc_time_array->value(FullGC) = heap->total_full_gc_time_ms() / 1000.0;
++
++  sp->findIntValue(kHeapPageNumberValueName)->value() = 0;
++  sp->findIntValue(kHeapSOSPageNumberValueName)->value() = 0;
++  sp->findIntValue(kHeapUsedSizeValueName)->value() = 0;
++  sp->findIntValue(kHeapCommittedSizeValueName)->value() = 0;
++  sp->findIntValue(kHeapReservedSizeValueName)->value() = 0;
++}
++
++void GCviewGlue::UpdateSummarySpaceTotals(const char* space_name,
++                                          const char* from_space_name) {
++  gcview::Space* sp = gcview_->findSpace(space_name);
++  gcview::Space* from_sp = gcview_->findSpace(from_space_name);
++
++  sp->findIntValue(kHeapPageNumberValueName)->value() +=
++      from_sp->findIntValue(kPageNumberValueName)->value();
++  sp->findIntValue(kHeapSOSPageNumberValueName)->value() +=
++      from_sp->findIntValue(kSOSPageNumberValueName)->value();
++  sp->findIntValue(kHeapUsedSizeValueName)->value() +=
++      from_sp->findIntValue(kTotalUsedSizeValueName)->value();
++  sp->findIntValue(kHeapCommittedSizeValueName)->value() +=
++      from_sp->findIntValue(kTotalCommittedSizeValueName)->value();
++  sp->findIntValue(kHeapReservedSizeValueName)->value() +=
++      from_sp->findIntValue(kTotalReservedSizeValueName)->value();
++}
++
++void GCviewGlue::UpdateHeapSpace(const char* space_name, Space* space) {
++  gcview::Space* sp = gcview_->findSpace(space_name);
++  (void) sp;
++}
++
++void GCviewGlue::UpdateNewSpace(const char* space_name, NewSpace* space) {
++  UpdateHeapSpace(space_name, space);
++
++  gcview::Space* sp = gcview_->findSpace(space_name);
++  BoolA* is_committed_array = sp->findBoolArray(kIsCommittedArrayName);
++  SpaceUpdater updater(gcview_, space_name);
++
++  updater.ResetUsedCommitted();
++  is_committed_array->reset(false);
++
++  {
++    NewSpacePageIterator iter(space->active_space());
++    while (iter.has_next()) {
++      NewSpacePage* page = iter.next();
++      unsigned index = SpaceUpdater::GetNewPageIndex(space, page);
++      updater.SetUsed(index, page->area_size());
++      updater.SetCommitted(index, page->size());
++      is_committed_array->value(index) = true;
++    }
++  }
++
++  {
++    NewSpacePageIterator iter(space->inactive_space());
++    while (iter.has_next()) {
++      NewSpacePage* page = iter.next();
++      unsigned index = SpaceUpdater::GetNewPageIndex(space, page);
++      updater.SetCommitted(index, page->size());
++      is_committed_array->value(index) = true;
++    }
++  }
++
++  UpdateSummarySpaceTotals(kSummarySpaceName, space_name);
++}
++
++void GCviewGlue::UpdateFreeLists(const char* space_name, PagedSpace* space,
++                                 FreeListCategoryID id,
++                                 FreeListCategory* free_list_category) {
++  ASSERT_EQ(IsLevelMedium(), true);
++  ASSERT_LT(id, FreeListCategoryNum);
++
++  gcview::Space* sp = gcview_->findSpace(space_name);
++
++  IntA* free_chunk_dist_size_array = sp->findIntArray(kFreeChunkDistSizeName);
++  IntA* free_chunk_dist_population_array =
++      sp->findIntArray(kFreeChunkDistPopulationName);
++
++  int free_size_sum_bytes = 0;
++  int free_chunks = 0;
++  FreeListNode* node = free_list_category->top();
++  while (node != NULL) {
++    unsigned size_bytes = node->Size();
++    free_size_sum_bytes += size_bytes;
++    free_chunks += 1;
++
++    unsigned histo_index = FindHistoIndex(size_bytes);
++    free_chunk_dist_size_array->value(histo_index) += size_bytes;
++    free_chunk_dist_population_array->value(histo_index) += 1;
++
++    node = node->next();
++  }
++
++  ASSERT_EQ(free_size_sum_bytes, free_list_category->available());
++
++  sp->findIntValue(kTotalFreeChunksValueName)->value() += free_chunks;
++  sp->findIntArray(kFreeChunksArrayName)->value(id) = free_chunks;
++}
++
++void GCviewGlue::UpdatePagedSpace(const char* space_name,
++                                  PagedSpace* space) {
++  UpdateHeapSpace(space_name, space);
++
++  gcview::Space* sp = gcview_->findSpace(space_name);
++  const unsigned page_num = (unsigned) space->CountTotalPages();
++  SpaceUpdater updater(gcview_, space_name);
++  updater.Reset(page_num);
++
++  IntA* used_size_array = sp->findIntArray(kUsedSizeArrayName);
++
++  IntA* unavailable_free_size_array =
++      sp->findIntArray(kUnavailableFreeSizeArrayName);
++  unavailable_free_size_array->resize(page_num);
++
++  IntA* small_free_size_array = sp->findIntArray(kSmallFreeSizeArrayName);
++  small_free_size_array->resize(page_num);
++
++  IntA* medium_free_size_array = sp->findIntArray(kMediumFreeSizeArrayName);
++  medium_free_size_array->resize(page_num);
++
++  IntA* large_free_size_array = sp->findIntArray(kLargeFreeSizeArrayName);
++  large_free_size_array->resize(page_num);
++
++  IntA* huge_free_size_array = sp->findIntArray(kHugeFreeSizeArrayName);
++  huge_free_size_array->resize(page_num);
++
++  int total_unavailable_free_size = 0;
++  int total_small_free_size = 0;
++  int total_medium_free_size = 0;
++  int total_large_free_size = 0;
++  int total_huge_free_size = 0;
++
++  unsigned index = 0;
++  PageIterator iter(space);
++  while (iter.has_next()) {
++    ASSERT_LT(index, page_num);
++    Page* page = iter.next();
++    updater.AddPage(index, page);
++
++    int unavailable_free_size = (int) page->non_available_small_blocks();
++    int small_free_size = (int) page->available_in_small_free_list();
++    int medium_free_size = (int) page->available_in_medium_free_list();
++    int large_free_size = (int) page->available_in_large_free_list();
++    int huge_free_size = (int) page->available_in_huge_free_list();
++
++    unavailable_free_size_array->value(index) = unavailable_free_size;
++    small_free_size_array->value(index) = small_free_size;
++    medium_free_size_array->value(index) = medium_free_size;
++    large_free_size_array->value(index) = large_free_size;
++    huge_free_size_array->value(index) = huge_free_size;
++    int page_free_size = unavailable_free_size + small_free_size +
++                         medium_free_size + large_free_size + huge_free_size;
++    used_size_array->value(index) -= page_free_size;
++
++    total_unavailable_free_size += unavailable_free_size;
++    total_small_free_size += small_free_size;
++    total_medium_free_size += medium_free_size;
++    total_large_free_size += large_free_size;
++    total_huge_free_size += huge_free_size;
++
++    index += 1;
++  }
++
++  FreeList* free_list = space->free_list();
++#if 0
++  // These should hold but they don't. It looks as if the available() methods
++  // return the correct value (it's consistent with what we get after
++  // iterating over the free chunks for each free list).
++  ASSERT_EQ(total_small_free_size, free_list->small_list()->available());
++  ASSERT_EQ(total_medium_free_size, free_list->medium_list()->available());
++  ASSERT_EQ(total_large_free_size, free_list->large_list()->available());
++  ASSERT_EQ(total_huge_free_size, free_list->huge_list()->available());
++#endif // 0
++  IntV* total_free_size_value = sp->findIntValue(kTotalFreeSizeValueName);
++  total_free_size_value->value() =
++      total_unavailable_free_size +
++      free_list->small_list()->available() +
++      free_list->medium_list()->available() +
++      free_list->large_list()->available() +
++      free_list->huge_list()->available();
++
++  sp->findIntValue(kTotalUsedSizeValueName)->value() -=
++      total_free_size_value->value();
++
++  IntA* free_size_array = sp->findIntArray(kFreeSizeArrayName);
++  free_size_array->value(UnavailableList) = total_unavailable_free_size;
++  free_size_array->value(SmallList) = free_list->small_list()->available();
++  free_size_array->value(MediumList) = free_list->medium_list()->available();
++  free_size_array->value(LargeList) = free_list->large_list()->available();
++  free_size_array->value(HugeList) = free_list->huge_list()->available();
++
++  if (IsLevelMedium()) {
++    sp->findIntValue(kTotalFreeChunksValueName)->value() = 0;
++    sp->findIntArray(kFreeChunkDistSizeName)->reset();
++    sp->findIntArray(kFreeChunkDistPopulationName)->reset();
++
++    UpdateFreeLists(space_name, space, SmallList, free_list->small_list());
++    UpdateFreeLists(space_name, space, MediumList, free_list->medium_list());
++    UpdateFreeLists(space_name, space, LargeList, free_list->large_list());
++    UpdateFreeLists(space_name, space, HugeList, free_list->huge_list());
++  }
++
++  UpdateSummarySpaceTotals(kSummarySpaceName, space_name);
++}
++
++void GCviewGlue::UpdateCodeSpace(const char* space_name, PagedSpace* space) {
++  UpdatePagedSpace(space_name, space);
++
++  if (IsLevelHigh()) {
++    gcview::Space* sp = gcview_->findSpace(space_name);
++
++    const unsigned page_num = (unsigned) space->CountTotalPages();
++    const unsigned age_num = Code::kLastCodeAge + 1;
++
++    IntA* code_sizes[age_num];
++    code_sizes[0] = sp->findIntArray(kCodeSizeForNoAgeArrayName);
++    code_sizes[0]->resize(page_num);
++    code_sizes[0]->reset();
++    for (unsigned i = 1; i < age_num; i += 1) {
++      char buffer[64];
++      gcview::Utils::formatStr(buffer, 64, kCodeSizeForAgeArrayFormat, i);
++      code_sizes[i] = sp->findIntArray(buffer);
++      code_sizes[i]->resize(page_num);
++      code_sizes[i]->reset();
++    }
++
++    IntA* code_size_array = sp->findIntArray(kCodeSizeArrayName);
++    IntA* code_num_array = sp->findIntArray(kCodeNumberArrayName);
++    IntA* opt_func_size_array = sp->findIntArray(kOptFuncSizeArrayName);
++    IntA* opt_func_num_array = sp->findIntArray(kOptFuncNumberArrayName);
++    IntA* code_kind_size_array = sp->findIntArray(kCodeKindSizeArrayName);
++    IntA* code_kind_num_array = sp->findIntArray(kCodeKindNumberArrayName);
++
++    code_size_array->reset();
++    code_num_array->reset();
++    opt_func_size_array->reset();
++    opt_func_num_array->reset();
++    code_kind_size_array->reset();
++    code_kind_num_array->reset();
++
++    unsigned index = 0;
++    PageIterator iter(space);
++    while (iter.has_next()) {
++      ASSERT_LT(index, page_num);
++      Page* page = iter.next();
++
++      HeapObjectIterator obj_iter(page, NULL);
++      while (HeapObject* obj = obj_iter.Next()) {
++        if (obj->IsCode()) {
++          Code* code = Code::cast(obj);
++          unsigned age = (unsigned) code->GetAge();
++          int obj_size = obj->Size();
++          ASSERT_LE(age, age_num);
++          code_sizes[age]->value(index) += obj_size;
++          code_size_array->value(age) += obj_size;
++          code_num_array->value(age) += 1;
++
++          Code::Kind code_kind = code->kind();
++          code_kind_size_array->value((unsigned) code_kind) += obj_size;
++          code_kind_num_array->value((unsigned) code_kind) += 1;
++          if (code_kind == Code::OPTIMIZED_FUNCTION) {
++            opt_func_size_array->value(age) += obj_size;
++            opt_func_num_array->value(age) += 1;
++          }
++        }
++      }
++
++      index += 1;
++    }
++  }
++}
++
++void GCviewGlue::UpdateLargeObjectSpace(const char* space_name,
++                                        LargeObjectSpace* space) {
++  UpdateHeapSpace(space_name, space);
++
++  unsigned page_num = (unsigned) space->PageCount();
++  SpaceUpdater updater(gcview_, space_name);
++  updater.Reset(page_num);
++
++  unsigned index = 0;
++  LargePage* page = space->first_page();
++  while (page != NULL) {
++    updater.AddPage(index, page);
++    index += 1;
++    page = page->next_page();
++  }
++
++  UpdateSummarySpaceTotals(kSummarySpaceName, space_name);
++}
++
++void GCviewGlue::UpdateStoreBufferSpace(const char* space_name,
++                                        StoreBuffer* store_buffer) {
++  if (IsLevelMedium()) {
++    gcview::Space* sp = gcview_->findSpace(space_name);
++
++    sp->findIntValue(kSBNewBufferSizeValueName)->value() =
++        (int) store_buffer->GetNewBufferSize();
++    sp->findIntValue(kSBOldBufferLimitSizeValueName)->value() =
++        (int) store_buffer->GetOldBufferLimitSize();
++    sp->findIntValue(kSBOldBufferSizeValueName)->value() =
++        (int) store_buffer->GetOldBufferSize();
++    sp->findIntValue(kSBOverflowCountValueName)->value() =
++        (int) store_buffer->overflow_count();
++    sp->findIntValue(kSBCompactionCountValueName)->value() =
++        (int) store_buffer->compaction_count();
++
++    IntA* entry_num_array = sp->findIntArray(kSBEntryNumbersArrayName);
++    entry_num_array->reset();
++
++    Address* from = reinterpret_cast<Address*>(store_buffer->Start());
++    Address* to = reinterpret_cast<Address*>(store_buffer->Top());
++    for (Address* curr = from; curr < to; curr += 1) {
++      Address addr = *curr;
++      Page* addr_page = Page::FromAddress(addr);
++      AllocationSpace id = addr_page->owner()->identity();
++      entry_num_array->value(id - 1) += 1;
++    }
++  }
++}
++
++void GCviewGlue::DoEvent(Heap* heap, bool is_scavenge, bool is_start) {
++  if (gcview_ == NULL) return;
++
++  ASSERT_EQ(FLAG_gcview_enable, true);
++  ASSERT_NE(writer_, NULL);
++  ASSERT_NE(array_writer_, NULL);
++
++  const char* event_name = NULL;
++  if (is_scavenge) {
++    event_name = (is_start) ? kScavengeStartEventName : kScavengeEndEventName;
++  } else {
++    event_name = (is_start) ? kFullGCStartEventName : kFullGCEndEventName;
++  }
++
++  if (gcview_->eventStart(event_name, GetNowSec())) {
++    UpdateSummarySpace(kSummarySpaceName, heap);
++    UpdateNewSpace(kNewSpaceName, heap->new_space());
++    UpdatePagedSpace(kOldPointerSpaceName, heap->old_pointer_space());
++    UpdatePagedSpace(kOldDataSpaceName, heap->old_data_space());
++    UpdateCodeSpace(kCodeSpaceName, heap->code_space());
++    UpdatePagedSpace(kMapSpaceName, heap->map_space());
++    UpdatePagedSpace(kCellSpaceName, heap->cell_space());
++    UpdatePagedSpace(kPropertyCellSpaceName, heap->property_cell_space());
++    UpdateLargeObjectSpace(kLargeObjectSpaceName, heap->lo_space());
++    UpdateStoreBufferSpace(kStoreBufferSpaceName, heap->store_buffer());
++
++    gcview_->eventEnd(GetNowSec());
++
++    array_writer_->startElem();
++    gcview_->writeJSONData(writer_);
++  }
++}
++
++////////// Tear Down //////////
++
++void GCviewGlue::TearDown() {
++  if (gcview_ == NULL) return;
++  ASSERT_EQ(FLAG_gcview_enable, true);
++  ASSERT_NE(writer_, NULL);
++  ASSERT_NE(array_writer_, NULL);
++
++  delete array_writer_;
++  array_writer_ = NULL;
++
++  delete writer_;
++  writer_ = NULL;
++
++  delete gcview_;
++  gcview_ = NULL;
++}
++
++}
++}  // namespace v8::internal
+diff --git a/src/gcview-glue.h b/src/gcview-glue.h
+new file mode 100644
+index 0000000..3506c2a
+--- /dev/null
++++ b/src/gcview-glue.h
+@@ -0,0 +1,130 @@
++// Copyright 2012 the V8 project authors. All rights reserved.
++// Redistribution and use in source and binary forms, with or without
++// modification, are permitted provided that the following conditions are
++// met:
++//
++//     * Redistributions of source code must retain the above copyright
++//       notice, this list of conditions and the following disclaimer.
++//     * Redistributions in binary form must reproduce the above
++//       copyright notice, this list of conditions and the following
++//       disclaimer in the documentation and/or other materials provided
++//       with the distribution.
++//     * Neither the name of Google Inc. nor the names of its
++//       contributors may be used to endorse or promote products derived
++//       from this software without specific prior written permission.
++//
++// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++
++#ifndef V8_GCVIEW_GLUE_H_
++#define V8_GCVIEW_GLUE_H_
++
++#include "allocation.h"
++
++namespace gcview {
++
++// We do forward declarations of the GCview classes so that we don't have
++// to recompile everything every time one of those classes is changed.
++class GCview;
++class JSONArrayWriter;
++class JSONWriter;
++class Space;
++
++} // namespace gcview
++
++namespace v8 {
++namespace internal {
++
++class FixedSpace;
++class FreeListCategory;
++class LargeObjectSpace;
++class NewSpace;
++class Page;
++class PagedSpace;
++class Space;
++class StoreBuffer;
++class SpaceUpdater;
++
++class GCviewGlue BASE_EMBEDDED {
++  friend class SpaceUpdater;
++
++public:
++  GCviewGlue();
++  void SetUp(Heap* heap);
++  void DoEvent(Heap* heap, bool is_scavenge, bool is_start);
++  void TearDown();
++  ~GCviewGlue() { TearDown(); }
++
++private:
++  typedef enum {
++    UnavailableList = 0,
++    SmallList,
++    MediumList,
++    LargeList,
++    HugeList,
++
++    FreeListCategoryNum
++  } FreeListCategoryID;
++
++  typedef enum {
++    ScavengeGC = 0,
++    FullGC,
++
++    GCTypeNum
++  } GCType;
++
++  static double GetNowSec() { return OS::TimeCurrentMillis() / 1000.0; }
++
++  unsigned FindHistoIndex(unsigned size_bytes);
++  static unsigned FindPageIndex(PagedSpace* space, Page* page);
++
++  gcview::Space* AddSummarySpace(const char* space_name);
++  gcview::Space* AddHeapSpace(const char* space_name, Space* space);
++  gcview::Space* AddNewSpace(const char* space_name, NewSpace* space);
++  gcview::Space* AddPagedSpace(const char* space_name, PagedSpace* space);
++  gcview::Space* AddFixedSpace(const char* space_name, FixedSpace* space);
++  gcview::Space* AddCodeSpace(const char* space_name, PagedSpace* space);
++  gcview::Space* AddLargeObjectSpace(const char* space_name,
++                                     LargeObjectSpace* space);
++  gcview::Space* AddStoreBufferSpace(const char* space_name,
++                                     StoreBuffer* store_buffer);
++
++  void UpdateSummarySpace(const char* space_name, Heap* heap);
++  void UpdateSummarySpaceTotals(const char* space_name,
++                                const char* from_space_name);
++  void UpdateHeapSpace(const char* space_name, Space* space);
++  void UpdateNewSpace(const char* space_name, NewSpace* space);
++  void UpdateFreeLists(const char* space_name, PagedSpace* space,
++                       FreeListCategoryID id,
++                       FreeListCategory* free_list_category);
++  void UpdatePagedSpace(const char* space_name, PagedSpace* space);
++  void UpdateCodeSpace(const char* space_name, PagedSpace* space);
++  void UpdateLargeObjectSpace(const char* space_name, LargeObjectSpace* space);
++  void UpdateStoreBufferSpace(const char* space_name,
++                              StoreBuffer* store_buffer);
++
++  bool IsLevelMedium() const { return level_ >= 1; }
++  bool IsLevelHigh() const { return level_ >= 2; }
++
++  // 0 -> low, 1 -> medium, 2 -> high
++  int level_;
++  unsigned free_histo_limits_num_;
++
++  gcview::GCview* gcview_;
++  gcview::JSONWriter* writer_;
++  gcview::JSONArrayWriter* array_writer_;
++};
++
++}
++}  // namespace v8::internal
++
++#endif // V8_GCVIEW_GLUE_H_
+diff --git a/src/heap.cc b/src/heap.cc
+index 5710b63..4fc3cc2 100644
+--- a/src/heap.cc
++++ b/src/heap.cc
+@@ -111,6 +111,12 @@ Heap::Heap()
+       gc_post_processing_depth_(0),
+       ms_count_(0),
+       gc_count_(0),
++      scavenge_count_(0),
++      full_gc_count_(0),
++      last_scavenge_time_ms_(0.0),
++      last_full_gc_time_ms_(0.0),
++      total_scavenge_time_ms_(0.0),
++      total_full_gc_time_ms_(0.0),
+       remembered_unmapped_pages_index_(0),
+       unflattened_strings_length_(0),
+ #ifdef DEBUG
+@@ -916,6 +922,11 @@ bool Heap::PerformGarbageCollection(GarbageCollector collector,
+   GCType gc_type =
+       collector == MARK_COMPACTOR ? kGCTypeMarkSweepCompact : kGCTypeScavenge;
+ 
++  gcview_glue_.DoEvent(this, gc_type == kGCTypeScavenge,
++                       true /* is_gc_start */);
++
++  double start_time_ms = OS::TimeCurrentMillis();
++
+   {
+     GCTracer::Scope scope(tracer, GCTracer::Scope::EXTERNAL);
+     VMState<EXTERNAL> state(isolate_);
+@@ -1027,6 +1038,22 @@ bool Heap::PerformGarbageCollection(GarbageCollector collector,
+     CallGCEpilogueCallbacks(gc_type);
+   }
+ 
++  double end_time_ms = OS::TimeCurrentMillis();
++  double elapsed_time_ms = end_time_ms - start_time_ms;
++
++  if (gc_type == kGCTypeScavenge) {
++    scavenge_count_ += 1;
++    last_scavenge_time_ms_ = elapsed_time_ms;
++    total_scavenge_time_ms_ += elapsed_time_ms;
++  } else {
++    full_gc_count_ += 1;
++    last_full_gc_time_ms_ = elapsed_time_ms;
++    total_full_gc_time_ms_ += elapsed_time_ms;
++  }
++
++  gcview_glue_.DoEvent(this, gc_type == kGCTypeScavenge,
++                       false /* is_gc_start */);
++
+ #ifdef VERIFY_HEAP
+   if (FLAG_verify_heap) {
+     VerifyStringTable();
+@@ -6814,6 +6841,8 @@ bool Heap::SetUp() {
+   relocation_mutex_locked_by_optimizer_thread_ = false;
+ #endif  // DEBUG
+ 
++  gcview_glue_.SetUp(this);
++
+   return true;
+ }
+ 
+@@ -6925,6 +6954,8 @@ void Heap::TearDown() {
+   isolate_->memory_allocator()->TearDown();
+ 
+   delete relocation_mutex_;
++
++  gcview_glue_.TearDown();
+ }
+ 
+ 
+diff --git a/src/heap.h b/src/heap.h
+index 70d1ccb..6f08b17 100644
+--- a/src/heap.h
++++ b/src/heap.h
+@@ -32,6 +32,7 @@
+ 
+ #include "allocation.h"
+ #include "assert-scope.h"
++#include "gcview-glue.h"
+ #include "globals.h"
+ #include "incremental-marking.h"
+ #include "list.h"
+@@ -1373,6 +1374,13 @@ class Heap {
+   // Number of mark-sweeps.
+   unsigned int ms_count() { return ms_count_; }
+ 
++  unsigned int scavenge_count() const { return scavenge_count_; }
++  unsigned int full_gc_count() const { return full_gc_count_; }
++  double last_scavenge_time_ms() const { return last_scavenge_time_ms_; }
++  double last_full_gc_time_ms() const { return last_full_gc_time_ms_; }
++  double total_scavenge_time_ms() const { return total_scavenge_time_ms_; }
++  double total_full_gc_time_ms() const { return total_full_gc_time_ms_; }
++
+   // Iterates over all roots in the heap.
+   void IterateRoots(ObjectVisitor* v, VisitMode mode);
+   // Iterates over all strong roots in the heap.
+@@ -1981,6 +1989,15 @@ class Heap {
+   unsigned int ms_count_;  // how many mark-sweep collections happened
+   unsigned int gc_count_;  // how many gc happened
+ 
++  // TODO:
++  unsigned int scavenge_count_;
++  // TODO:
++  unsigned int full_gc_count_;
++  double last_scavenge_time_ms_;
++  double last_full_gc_time_ms_;
++  double total_scavenge_time_ms_;
++  double total_full_gc_time_ms_;
++
+   // For post mortem debugging.
+   static const int kRememberedUnmappedPages = 128;
+   int remembered_unmapped_pages_index_;
+@@ -2406,6 +2423,8 @@ class Heap {
+   bool relocation_mutex_locked_by_optimizer_thread_;
+ #endif  // DEBUG;
+ 
++  GCviewGlue gcview_glue_;
++
+   friend class Factory;
+   friend class GCTracer;
+   friend class DisallowAllocationFailure;
+diff --git a/src/isolate.h b/src/isolate.h
+index 76a5a41..f475312 100644
+--- a/src/isolate.h
++++ b/src/isolate.h
+@@ -1110,11 +1110,11 @@ class Isolate {
+   HStatistics* GetHStatistics();
+   HTracer* GetHTracer();
+ 
++  int id() const { return static_cast<int>(id_); }
++
+  private:
+   Isolate();
+ 
+-  int id() const { return static_cast<int>(id_); }
+-
+   friend struct GlobalState;
+   friend struct InitializeGlobalState;
+ 
+diff --git a/src/spaces.h b/src/spaces.h
+index ca61081..a84f607 100644
+--- a/src/spaces.h
++++ b/src/spaces.h
+@@ -1415,9 +1415,9 @@ class FreeListNode: public HeapObject {
+   void set_size(Heap* heap, int size_in_bytes);
+ 
+   // Accessors for the next field.
+-  inline FreeListNode* next();
+-  inline FreeListNode** next_address();
+-  inline void set_next(FreeListNode* next);
++  FreeListNode* next();
++  FreeListNode** next_address();
++  void set_next(FreeListNode* next);
+ 
+   inline void Zap();
+ 
+@@ -1820,9 +1820,9 @@ class PagedSpace : public Space {
+     return area_size_;
+   }
+ 
+- protected:
+   FreeList* free_list() { return &free_list_; }
+ 
++protected:
+   int area_size_;
+ 
+   // Maximum capacity of this space.
+@@ -2477,6 +2477,7 @@ class NewSpace : public Space {
+   }
+ 
+   SemiSpace* active_space() { return &to_space_; }
++  SemiSpace* inactive_space() { return &from_space_; }
+ 
+  private:
+   // Update allocation info to match the current to-space page.
+diff --git a/src/store-buffer.cc b/src/store-buffer.cc
+index fd6366a..cd7f84a 100644
+--- a/src/store-buffer.cc
++++ b/src/store-buffer.cc
+@@ -53,7 +53,9 @@ StoreBuffer::StoreBuffer(Heap* heap)
+       virtual_memory_(NULL),
+       hash_set_1_(NULL),
+       hash_set_2_(NULL),
+-      hash_sets_are_empty_(true) {
++      hash_sets_are_empty_(true),
++      compaction_count_(0),
++      overflow_count_(0) {
+ }
+ 
+ 
+@@ -121,6 +123,7 @@ void StoreBuffer::TearDown() {
+ 
+ void StoreBuffer::StoreBufferOverflow(Isolate* isolate) {
+   isolate->heap()->store_buffer()->Compact();
++  isolate->heap()->store_buffer()->IncOverflowCount();
+ }
+ 
+ 
+@@ -690,6 +693,7 @@ void StoreBuffer::Compact() {
+     ASSERT(old_top_ <= old_limit_);
+   }
+   heap_->isolate()->counters()->store_buffer_compactions()->Increment();
++  compaction_count_ += 1;
+ }
+ 
+ } }  // namespace v8::internal
+diff --git a/src/store-buffer.h b/src/store-buffer.h
+index 520cbc0..0968fe1 100644
+--- a/src/store-buffer.h
++++ b/src/store-buffer.h
+@@ -104,6 +104,16 @@ class StoreBuffer {
+     old_top_ = reinterpret_cast<Address*>(top);
+   }
+ 
++  size_t GetNewBufferSize() const { return (size_t) (limit_ - start_); }
++
++  size_t GetOldBufferSize() const {
++    return (size_t) (old_limit_ - old_start_);
++  }
++
++  size_t GetOldBufferLimitSize() const {
++    return (size_t) (old_top_ - old_start_);
++  }
++
+   bool old_buffer_is_sorted() { return old_buffer_is_sorted_; }
+   bool old_buffer_is_filtered() { return old_buffer_is_filtered_; }
+ 
+@@ -124,6 +134,11 @@ class StoreBuffer {
+ 
+   void Filter(int flag);
+ 
++  void IncOverflowCount() { overflow_count_ += 1; }
++
++  size_t compaction_count() const { return compaction_count_; }
++  size_t overflow_count() const { return overflow_count_; }
++
+  private:
+   Heap* heap_;
+ 
+@@ -158,6 +173,9 @@ class StoreBuffer {
+   uintptr_t* hash_set_2_;
+   bool hash_sets_are_empty_;
+ 
++  size_t compaction_count_;
++  size_t overflow_count_;
++
+   void ClearFilteringHashSets();
+ 
+   bool SpaceAvailable(intptr_t space_needed);
+diff --git a/tools/gyp/v8.gyp b/tools/gyp/v8.gyp
+index ed37e72..5272cec 100644
+--- a/tools/gyp/v8.gyp
++++ b/tools/gyp/v8.gyp
+@@ -192,11 +192,36 @@
+       ]
+     },
+     {
++      'target_name': 'gcview',
++      'type': 'static_library',
++      'variables': {
++        'GCVIEW_DIR' : '../../src/gcview',
++      },
++      'include_dirs+': [
++        '<(GCVIEW_DIR)/src',
++      ],
++      'sources': [
++        '<(GCVIEW_DIR)/src/array.hpp',
++        '<(GCVIEW_DIR)/src/data.cpp',
++        '<(GCVIEW_DIR)/src/data.hpp',
++        '<(GCVIEW_DIR)/src/gcview.cpp',
++        '<(GCVIEW_DIR)/src/gcview.hpp',
++        '<(GCVIEW_DIR)/src/json.hpp',
++        '<(GCVIEW_DIR)/src/space.cpp',
++        '<(GCVIEW_DIR)/src/space.hpp',
++        '<(GCVIEW_DIR)/src/utils.cpp',
++        '<(GCVIEW_DIR)/src/utils.hpp',
++      ],
++    },
++    {
+       'target_name': 'v8_base.<(v8_target_arch)',
+       'type': 'static_library',
+       'variables': {
+         'optimize': 'max',
+       },
++      'dependencies' : [
++        'gcview',
++      ],
+       'include_dirs+': [
+         '../../src',
+       ],
+@@ -305,6 +330,8 @@
+         '../../src/full-codegen.h',
+         '../../src/func-name-inferrer.cc',
+         '../../src/func-name-inferrer.h',
++        '../../src/gcview-glue.cc',
++        '../../src/gcview-glue.h',
+         '../../src/gdb-jit.cc',
+         '../../src/gdb-jit.h',
+         '../../src/global-handles.cc',
