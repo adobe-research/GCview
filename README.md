@@ -1,7 +1,7 @@
 GCview
 ======
 
-GC / open osurce memory management visualization and monitoring framework.
+GC / open source memory management visualization and monitoring framework.
 Licensed under the Apache Software License 2.0
 
 ---
